@@ -2,6 +2,7 @@ from SPARS.Simulator.Algo.easy_adaptive import EASYAdaptive
 from SPARS.Simulator.Algo.easy_auto_switch_on import EASYAuto
 from SPARS.Simulator.Algo.easy_balanced import EASYBalanced
 from SPARS.Simulator.Algo.easy_normal import EASYNormal
+from SPARS.Simulator.Algo.pso_malleable import PSOMalleable
 from SPARS.Simulator.Algo.fcfs_auto_switch_on import FCFSAuto
 from SPARS.Simulator.Algo.fcfs_normal import FCFSNormal
 
@@ -12,6 +13,7 @@ ALGO_MAP = {
     'easy_auto': EASYAuto,
     'easy_balanced': EASYBalanced,
     'easy_adaptive': EASYAdaptive,
+    'pso_malleable': PSOMalleable,
 }
 
 

@@ -99,8 +99,10 @@ class PlatformControl:
             return actual_finish_time, event
 
     def change_dvfs_mode(self, node_ids, mode):
+        if isinstance(node_ids, int):
+            node_ids = [node_ids]
         self.machines.change_dvfs_mode(node_ids, mode)
-        return {'type': 'change_dvfs_mode', 'node': node_ids, 'mode': mode}
+        return {'type': 'change_dvfs_mode', 'nodes': node_ids, 'mode': mode}
 
     def release(self, event, current_time):
         terminated = False  # under request
