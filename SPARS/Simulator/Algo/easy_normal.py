@@ -1,0 +1,226 @@
+from .fcfs_normal import FCFSNormal
+from itertools import combinations
+from bisect import bisect_left
+
+
+class EASYNormal(FCFSNormal):
+    def schedule(self, new_state, waiting_queue, scheduled_queue, resources_agenda):
+        super().prep_schedule(new_state, waiting_queue, scheduled_queue, resources_agenda)
+        super().FCFSNormal()
+
+        self.backfill()
+
+        if self.timeout is not None:
+            super().timeout_policy()
+
+        return self.events
+
+    def find_node_combination(self, p_start_t, compute_demand, nodes, next_releases, x):
+        """
+        Returns a tuple (best_combo, best_finish_time)
+        - best_combo: list[dict node] or None
+        - best_finish_time: float (0 if None)
+
+        Idea:
+        For a cutoff r (candidate "max activation delay"), a combo of size x is feasible iff
+            min_speed >= compute_demand / (p_start_t - r)
+        using only nodes with release_time <= r.
+        We scan r across unique release times (ascending), keep eligible nodes in a list
+        sorted by speed, and check feasibility with a bisect. This avoids combinations().
+        """
+        n = len(nodes)
+        if x > n or x <= 0:
+            return None
+
+        # --- Precompute release times and filter impossible nodes early
+        release_by_id = {e['id']: e['release_time'] for e in next_releases}
+        cand = []
+        for nd in nodes:
+            s = float(nd.get('compute_speed', 0) or 0.0)
+            if s <= 0:
+                continue
+            rid = nd['id']
+            r = float(release_by_id.get(rid, 0.0))
+            # If r >= p_start_t, this node can never finish a positive-demand job before p_start_t
+            if r >= p_start_t:
+                continue
+            cand.append((r, s, nd))  # (release_time, speed, node_ref)
+
+        if len(cand) < x:
+            return None
+
+        # Sort candidates by release_time ascending
+        cand.sort(key=lambda t: t[0])
+        unique_r = sorted(set(r for r, _, _ in cand))
+
+        # We'll maintain a list of eligible nodes (those with release_time <= r), sorted by speed asc
+        eligible = []              # list of (speed, node_ref, release_time)
+        eligible_speeds = []       # parallel list of speeds for bisect
+        idx_cand = 0
+        best_finish_time = 0.0
+        best_combo = None
+
+        for r in unique_r:
+            # Add all nodes with release_time == r into eligible
+            while idx_cand < len(cand) and cand[idx_cand][0] <= r:
+                ri, si, ndi = cand[idx_cand]
+                # insert by speed (ascending)
+                pos = bisect_left(eligible_speeds, si)
+                eligible_speeds.insert(pos, si)
+                eligible.insert(pos, (si, ndi, ri))
+                idx_cand += 1
+
+            # Compute required minimum speed at this cutoff
+            remain = p_start_t - r
+            if remain <= 0:
+                continue  # impossible at this r
+
+            min_speed_req = compute_demand / remain
+
+            # Count how many eligible nodes have speed >= min_speed_req
+            pos = bisect_left(eligible_speeds, min_speed_req)
+            avail = len(eligible_speeds) - pos
+            if avail < x:
+                continue  # not feasible at this r
+
+            # Choose the x *slowest* nodes that still meet the threshold (tight finish time)
+            # [(speed, node, release_time), ...]
+            chosen = eligible[pos: pos + x]
+            speeds = [t[0] for t in chosen]
+            nodes_sel = [t[1] for t in chosen]
+            rel_times = [t[2] for t in chosen]
+
+            s_min = min(speeds)                     # == eligible_speeds[pos]
+            # may be <= r; use the actual max of chosen
+            r_max = max(rel_times)
+            finish_time = r_max + (compute_demand / s_min)
+
+            # Keep the latest finish time that still fits
+            if finish_time <= p_start_t and finish_time > best_finish_time:
+                best_finish_time = finish_time
+                best_combo = nodes_sel
+
+        return best_combo
+
+    def backfill(self):
+
+        waiting_queue = [
+            job for job in self.waiting_queue if job['job_id'] not in self.scheduled]
+        if len(waiting_queue) > 2:
+            p_job = waiting_queue[0]
+
+            backfilling_queue = waiting_queue[1:]
+
+            reserved_nodes = self.allocated
+
+            not_reserved_nodes = [
+                node for node in self.state if node['id'] not in reserved_nodes]
+
+            next_releases = self.resources_agenda
+
+            next_releases = sorted(
+                next_releases,
+                key=lambda x: (x['release_time'], x['id'])
+            )
+
+            if len(next_releases) < p_job['res']:
+                return
+
+            last_host = next_releases[p_job['res'] - 1]
+            p_start_t = last_host['release_time']
+
+            candidates = [r['id']
+                          for r in next_releases if r['release_time'] <= p_start_t]
+            head_job_reservation_ids = candidates[-p_job['res']:]
+
+            not_reserved_nodes = [
+                r for r in not_reserved_nodes if r['id'] not in head_job_reservation_ids]
+
+            for job in backfilling_queue:
+
+                allocated_ids = [node['id'] for node in self.allocated]
+                not_computing_resource_ids = [
+                    node['id'] for node in self.state if node['job_id'] is None and node['id'] not in allocated_ids]
+                not_reserved_ids = [
+                    h for h in not_computing_resource_ids if h not in head_job_reservation_ids]
+
+                available_resources_not_reserved = [
+                    node for node in self.available if node['id'] in not_reserved_ids]
+
+                if job['res'] <= len(not_reserved_ids):
+                    if job['res'] <= len(available_resources_not_reserved):
+                        allocated_nodes = available_resources_not_reserved[:job['res']]
+                        allocated_ids = [node['id']
+                                         for node in allocated_nodes]
+
+                        event = {
+                            'job_id': job['job_id'],
+                            'subtime': job['subtime'],
+                            'runtime': job['runtime'],
+                            'reqtime': job['reqtime'],
+                            'res': job['res'],
+                            'type': 'execution_start',
+                            'nodes': allocated_ids
+                        }
+                        if self.timeout:
+                            super().remove_from_timeout_list(allocated_ids)
+
+                        self.available = [
+                            node for node in self.available if node['id'] not in allocated_ids]
+                        self.allocated.extend(allocated_nodes)
+                        self.jobs_manager.add_job_to_scheduled_queue(
+                            event['job_id'], allocated_ids, self.current_time)
+                        super().push_event(self.current_time, event)
+                        """should update releases agenda, do the same for others'
+                        """
+
+                else:
+                    allocated_ids = [node['id']
+                                     for node in self.allocated]
+                    # since this algo doesnt want to have to_activate, so we should remove sleeping node
+                    not_computing_resource_ids = [
+                        node['id'] for node in self.state if node['job_id'] is None and node['id'] not in allocated_ids and node['state'] != 'sleeping' and node['state'] != 'switching_off' and node['state'] != 'switching_on']
+
+                    compute_demand = job['reqtime']
+                    free_nodes = [{'id': node['id'], 'compute_speed': node['compute_speed']}
+                                  for node in self.state if node['id'] in not_computing_resource_ids]
+
+                    combo = self.find_node_combination(
+                        p_start_t, compute_demand, free_nodes, next_releases, job['res'])
+
+                    if combo == None:
+                        continue
+
+                    inactive_ids = {
+                        n['id'] for n in (self.inactive or [])
+                        if isinstance(n, dict) and 'id' in n
+                    }
+
+                    to_activate = [
+                        n for n in (combo or [])
+                        if isinstance(n, dict) and n.get('id') in inactive_ids
+                    ]
+
+                    if len(to_activate) == 0:
+                        allocated_nodes = self.available[:job['res']]
+                        self.allocated.extend(allocated_nodes)
+                        allocated_ids = [node['id']
+                                         for node in allocated_nodes]
+
+                        event = {
+                            'job_id': job['job_id'],
+                            'subtime': job['subtime'],
+                            'runtime': job['runtime'],
+                            'reqtime': job['reqtime'],
+                            'res': job['res'],
+                            'type': 'execution_start',
+                            'nodes': allocated_ids
+                        }
+                        if self.timeout:
+                            super().remove_from_timeout_list(allocated_ids)
+
+                        self.available = self.available[job['res']:]
+                        self.jobs_manager.add_job_to_scheduled_queue(
+                            event['job_id'], allocated_ids, self.current_time)
+
+                        super().push_event(self.current_time, event)
